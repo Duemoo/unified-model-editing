@@ -3,6 +3,7 @@ import shutil
 from itertools import islice
 from time import time
 from typing import Tuple, Union
+from tqdm import tqdm
 import sys
 import os
 
@@ -22,7 +23,7 @@ from dsets import (
 from experiments.py.eval_utils_counterfact import compute_rewrite_quality_counterfact
 from experiments.py.eval_utils_zsre import compute_rewrite_quality_zsre
 from memit import MEMITHyperParams, apply_memit_to_model
-from rome import ROMEHyperParams, apply_rome_to_model
+from rome import ROMEHyperParams, apply_rome_to_model, apply_rome_noise_to_model
 from emmet import EMMETHyperParams, apply_emmet_to_model
 from util import nethook
 from util.globals import *
@@ -33,6 +34,7 @@ ALG_DICT = {
     "EMMET": (EMMETHyperParams, apply_emmet_to_model),
     "MEMIT": (MEMITHyperParams, apply_memit_to_model),
     "ROME": (ROMEHyperParams, apply_rome_to_model),
+    "ROME_NOISE": (ROMEHyperParams, apply_rome_noise_to_model),
     "FT": (FTHyperParams, apply_ft_to_model),
     "MEND": (MENDHyperParams, MendRewriteExecutor().apply_to_model),
 }
@@ -129,6 +131,7 @@ def main(
         original_model = AutoModelForCausalLM.from_pretrained(model_name)
         tok = AutoTokenizer.from_pretrained(model_name)
         tok.pad_token = tok.eos_token
+        tok.padding_side = "left"
 
         original_weights = extract_model_original_weights(original_model, hparams)
         del original_model
@@ -180,7 +183,21 @@ def main(
     sampled_indices = json.load(f)
 
     # Iterate through dataset
-    for r, e in enumerate(range(0, len(sampled_indices[args.sample_num]), num_edits)):
+    total_edits = len(sampled_indices[args.sample_num])
+    progress_bar = tqdm(
+        enumerate(range(0, total_edits, num_edits)), 
+        total=total_edits//num_edits,
+        desc=f"Processing {alg_name} edits",
+        unit="batch"
+    )
+
+    for r, e in progress_bar:
+        # Update progress bar with current edit info
+        progress_bar.set_postfix({
+            'edit_batch': r,
+            'total_edits': min(e + num_edits, total_edits),
+            'algorithm': alg_name
+        })
         record_chunks = []
         for element_index in sampled_indices[args.sample_num][e: min(e+num_edits, len(sampled_indices[args.sample_num]))]:
             datapoint = dataset.__getitem__(element_index)
@@ -315,6 +332,12 @@ def main(
         #Do GLUE EVALUATION
         distance = get_model_distance(original_weights, edited_model, hparams)
 
+        # In evaluate_unified_editing.py, around line 320:
+        flags = [_ in downstream_tasks for _ in ['sst', 'mmlu', 'mrpc', 'cola', 'rte', 'nli', 'sentiment_analysis', 'dialogue']]
+        print(f"🔍 DEBUG: downstream_tasks = {downstream_tasks}")
+        print(f"🔍 DEBUG: flags = {flags}")
+        print(f"🔍 DEBUG: Tasks being evaluated: {['sst', 'mmlu', 'mrpc', 'cola', 'rte', 'nli', 'sentiment_analysis', 'dialogue']}")
+
         glue_results = {
             'edit_num': r,
             'case_id': case_ids,
@@ -446,7 +469,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--alg_name",
-        choices=["MEMIT", "ROME", "EMMET", "FT"],
+        choices=["MEMIT", "ROME", "EMMET", "FT", "ROME_NOISE"],
         default="EMMET",
         help="Editing algorithm to use. Results are saved in results/<alg_name>/<run_id>, "
         "where a new run_id is generated on each run. "
@@ -454,8 +477,14 @@ if __name__ == "__main__":
         required=False,
     )
     parser.add_argument(
+        "--noise_matching_strategy",
+        default="random_rank1",
+        choices=["random_rank1", "scaled_random", "full_rank"],
+        help="Noise generation strategy"
+    )
+    parser.add_argument(
         "--model_name",
-        choices=["gpt2-medium", "gpt2-large", "gpt2-xl", "EleutherAI/gpt-j-6B", "Llama-2-7b"],
+        choices=["gpt2-medium", "gpt2-large", "gpt2-xl", "EleutherAI/gpt-j-6b", "Llama-2-7b"],
         default="gpt2-xl",
         help="Model to edit.",
         required=False,

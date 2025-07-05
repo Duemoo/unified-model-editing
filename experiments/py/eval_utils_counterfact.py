@@ -358,6 +358,6 @@ def compute_freq(sentence, token_entropy,  n=2, tokenizer=None):
 
 
 def tfidf_similarity(text_a, text_b, vec):
-    encs = vec.transform([text_a, text_b]).A
+    encs = vec.transform([text_a, text_b]).toarray()
     norm = np.linalg.norm
     return (np.dot(encs[0], encs[1]) / norm(encs[0]) / norm(encs[1])).item()

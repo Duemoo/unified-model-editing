@@ -14,7 +14,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 import sys
 
 sys.path.append('/data/christinefang/unified-model-editing/experiments/py')##Remember to add /experiments/py after the part
-from eval_utils_counterfact import *
+from .eval_utils_counterfact import *
 
 from dsets import AttributeSnippets
 

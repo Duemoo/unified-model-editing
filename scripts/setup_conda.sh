@@ -22,12 +22,12 @@ else
 	echo "Running on $machine..."
 fi
 
-if [[ -z "${CONDA_HOME}" ]]; then
-  echo "Please specify the CONDA_HOME environment variable (it might look something like ~/miniconda3)."
-  exit 1
-else
-  echo "Found CONDA_HOME=${CONDA_HOME}."
-fi
+# if [[ -z "${CONDA_HOME}" ]]; then
+#   echo "Please specify the CONDA_HOME environment variable (it might look something like ~/miniconda3)."
+#   exit 1
+# else
+#   echo "Found CONDA_HOME=${CONDA_HOME}."
+# fi
 
 RECIPE=${RECIPE:-memit2}
 ENV_NAME="${ENV_NAME:-${RECIPE}}"
