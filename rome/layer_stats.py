@@ -87,35 +87,24 @@ def layer_stats(
     batch_tokens=None,
     download=True,
     progress=tqdm,
-    force_recompute=False,
 ):
     """
     Function to load or compute cached stats.
     """
-
-    collected_features = None
 
     def get_ds():
         raw_ds = load_dataset(
             ds_name,
             dict(wikitext="wikitext-103-raw-v1", wikipedia="20200501.en")[ds_name],
         )
-        try:
-            maxlen = model.config.n_positions
-        except:
-            maxlen = model.config.max_position_embeddings
-
+        maxlen = model.config.n_positions
         if batch_tokens is not None and batch_tokens < maxlen:
             maxlen = batch_tokens
         return TokenizedDataset(raw_ds["train"], tokenizer, maxlen=maxlen)
 
     # Continue with computation of statistics
-    batch_size = 1  # Examine this many dataset texts at once
-    try:
-        npos = model.config.n_positions
-    except:
-        npos = model.config.max_position_embeddings
-
+    batch_size = 100  # Examine this many dataset texts at once
+    npos = model.config.n_positions
     if batch_tokens is None:
         batch_tokens = npos * 3  # Sort and divide into batches with this many tokens
     if precision is None:
@@ -124,17 +113,8 @@ def layer_stats(
     size_suffix = "" if sample_size is None else f"_{sample_size}"
     if batch_tokens < npos:
         size_suffix = "_t{batch_tokens}" + size_suffix
-
-
     if model_name is None:
-        model_name = model.config._name_or_path
-        
-        #extra processing for local models
-        if 'data' in model_name:
-            model_name = model_name.split('/')[-1]
-
-        model_name = model_name.replace("/", "_")
-
+        model_name = model.config._name_or_path.replace("/", "_")
 
     stats_dir = Path(stats_dir)
     file_extension = f"{model_name}/{ds_name}_stats/{layer_name}_{precision}_{'-'.join(sorted(to_collect))}{size_suffix}.npz"
@@ -153,7 +133,6 @@ def layer_stats(
             print(f"Unable to download due to {e}. Computing locally....")
 
     ds = get_ds() if not filename.exists() else None
-    #ds = get_ds()
 
     if progress is None:
         progress = lambda x: x
@@ -162,7 +141,7 @@ def layer_stats(
     loader = tally(
         stat,
         ds,
-        cache=(filename if not force_recompute else None),
+        cache=filename,
         sample_size=sample_size,
         batch_size=batch_size,
         collate_fn=length_collation(batch_tokens),
@@ -171,10 +150,6 @@ def layer_stats(
         num_workers=2,
     )
     batch_count = -(-(sample_size or len(ds)) // batch_size)
-    
-    collected_features = []
-    total_collected_features = 0
-    num_preserve_features = 5e3 if 'llama' not in model.config._name_or_path.lower() else 1e3
     with torch.no_grad():
         for batch_group in progress(loader, total=batch_count):
             for batch in batch_group:
@@ -186,23 +161,8 @@ def layer_stats(
                 feats = flatten_masked_batch(tr.input, batch["attention_mask"])
                 # feats = flatten_masked_batch(tr.output, batch["attention_mask"])
                 feats = feats.to(dtype=dtype)
-
-                if 'llama' in model.config._name_or_path.lower():
-                    feats = feats.cpu()
-
-                if total_collected_features < num_preserve_features:            
-                    collected_features.append(feats)
-                    total_collected_features += feats.shape[0]
-
                 stat.add(feats)
-
-    if collected_features:          
-        collected_features = torch.cat(collected_features, dim = 0)
-        #clearing gpu memory
-        del feats
-        torch.cuda.empty_cache()
-
-    return stat, collected_features
+    return stat
 
 
 if __name__ == "__main__":

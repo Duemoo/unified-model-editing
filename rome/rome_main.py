@@ -1,11 +1,8 @@
 from copy import deepcopy
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
-import numpy as np
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
-import time
 
 from util import nethook
 from util.generate import generate_fast
@@ -24,7 +21,6 @@ def apply_rome_to_model(
     hparams: ROMEHyperParams,
     copy=False,
     return_orig_weights=False,
-    cache_template: Optional[str] = None,
 ) -> Tuple[AutoModelForCausalLM, List[str]]:
     """
     Returns a model with the desired changes.
@@ -35,27 +31,29 @@ def apply_rome_to_model(
     :return: (1) the updated model, (2) an original copy of the weights that changed
     """
 
+    assert (
+        hparams.enable_prompt_keys != hparams.enable_random_prefix_keys
+    ), "Both prompt and random prefix keys are enabled"
+
+    if not hparams.original_implementation:
+        print(
+            "Using key modification method:",
+            "use_prompt_keys"
+            if hparams.enable_prompt_keys
+            else "use_random_prefix_keys",
+        )
+
     if copy:
         model = deepcopy(model)
 
     weights_copy = {}
 
     for i, request in enumerate(requests):
-
-        # Caching is only valid on first request, since the model changes afterwards
-        deltas = execute_rome(
-            model, tok, request, hparams, (cache_template if i == 0 else None)
-        )
+        deltas = execute_rome(model, tok, request, hparams)
 
         with torch.no_grad():
             for w_name, (delta_u, delta_v) in deltas.items():
                 upd_matrix = delta_u.unsqueeze(1) @ delta_v.unsqueeze(0)
-
-                if hparams.bias_update:
-                    upd_bias = upd_matrix[-1,:]
-                    upd_matrix = upd_matrix[:-1,:]
-
-                #update weight matrix
                 w = nethook.get_parameter(model, w_name)
                 upd_matrix = upd_matrix_match_shape(upd_matrix, w.shape)
 
@@ -65,23 +63,9 @@ def apply_rome_to_model(
 
                 w[...] += upd_matrix
 
-                if hparams.bias_update:
-                    w_name = w_name.replace('.weight', '.bias')
-                    w = nethook.get_parameter(model, w_name)
-
-                    upd_matrix = upd_matrix_match_shape(upd_bias, w.shape)
-
-                    if return_orig_weights and w_name not in weights_copy:
-                        assert i == 0
-                        weights_copy[w_name] = w.detach().clone()
-
-                    w[...] += upd_matrix
-
-
-
         print(f"New weights successfully inserted into {list(deltas.keys())}")
 
-    return model, weights_copy, None
+    return model, weights_copy
 
 
 def execute_rome(
@@ -89,14 +73,11 @@ def execute_rome(
     tok: AutoTokenizer,
     request: Dict,
     hparams: ROMEHyperParams,
-    cache_template: Optional[str] = None,
 ) -> Dict[str, Tuple[torch.Tensor]]:
     """
     Executes the ROME update algorithm for the specified update at the specified layer
     Invariant: model at beginning of function == model at end of function
     """
-
-    print(request)
 
     # Update target and print info
     request = deepcopy(request)
@@ -115,106 +96,41 @@ def execute_rome(
         )
         for layer in hparams.layers
     }
-
     # Save old weights for future restoration
     weights_copy = {k: v.detach().clone() for k, v in weights.items()}
 
     # Update loop: sequentially intervene at each specified layer
     deltas = {}
-    hparams.layers = sorted(hparams.layers)
-    for layer in hparams.layers:
-        left_vector, right_vector = None, None
-        require_recompute = True
-
-        # Retrieve k/v pair if already stored in cache
-        # Must be first layer, since rewrites at previous layers affect future layers
-        if layer == hparams.layers[0]:
-            cache_fname = (
-                Path(
-                    str(cache_template).format(
-                        layer, hparams.clamp_norm_factor, request["case_id"]
-                    )
-                )
-                if cache_template is not None
-                else None
-            )
-            if (
-                cache_fname is not None  # Require cache template
-                and cache_fname.exists()  # Cache file must exist
-            ):
-                try:
-                    data = np.load(cache_fname)
-                    left_vector = torch.from_numpy(data["left_vector"]).to("cuda")
-                    right_vector = torch.from_numpy(data["right_vector"]).to("cuda")
-                    require_recompute = False
-                except Exception as e:
-                    print(f"Error reading cache file due to {e}. Recomputing...")
-
+    for layer in sorted(hparams.layers):
         # Compute rank-1 update matrix
-        if left_vector is None:
-            left_vector, inv_mom2_cache = compute_u(
-                model,
-                tok,
-                request,
-                hparams,
-                layer,
-                get_context_templates( model, tok, hparams.context_template_length_params),
-            )
+        left_vector: torch.Tensor = compute_u(
+            model,
+            tok,
+            request,
+            hparams,
+            layer,
+            get_context_templates(model, tok, hparams.context_template_length_params),
+        )
         print("Left vector shape:", left_vector.shape)
-
-        right_vector: torch.Tensor = (
-            right_vector
-            if right_vector is not None
-            else compute_v(
-                model,
-                tok,
-                request,
-                hparams,
-                layer,
-                left_vector,
-                get_context_templates( model, tok, hparams.context_template_length_params),
-            )
+        right_vector: torch.Tensor = compute_v(
+            model,
+            tok,
+            request,
+            hparams,
+            layer,
+            left_vector,
+            get_context_templates(model, tok, hparams.context_template_length_params),
         )
         print("Right vector shape:", right_vector.shape)
-
-        # Cache vectors for future use
-        if cache_fname is not None and require_recompute:
-            cache_fname.parent.mkdir(exist_ok=True, parents=True)
-            np.savez(
-                cache_fname,
-                **{
-                    "left_vector": left_vector.detach().cpu().numpy(),
-                    "right_vector": right_vector.detach().cpu().numpy(),
-                },
-            )
-            print(f"Cached k/v pair at {cache_fname}")
 
         with torch.no_grad():
             # Determine correct transposition of delta matrix
             weight_name = f"{hparams.rewrite_module_tmp.format(layer)}.weight"
             upd_matrix = left_vector.unsqueeze(1) @ right_vector.unsqueeze(0)
-
-            if hparams.bias_update:
-                upd_bias = upd_matrix[-1,:]
-                upd_matrix = upd_matrix[:-1,:]
-
             upd_matrix = upd_matrix_match_shape(upd_matrix, weights[weight_name].shape)
-
-            #check for PAST representation preservation
-            #print(weights[weight_name][...].shape, inv_mom2_cache['key_vectors'].shape, inv_mom2_cache['value_vectors'].shape)
-            
-            #diff = weights[weight_name][...].t() @ inv_mom2_cache['key_vectors'].t() - inv_mom2_cache['value_vectors'].t()
-            #print('distance before:', torch.norm(diff))
 
             # Update model weights and record desired changes in `delta` variable
             weights[weight_name][...] += upd_matrix
-
-            #calculate ||WK-V||
-            #diff = weights[weight_name][...].t() @ inv_mom2_cache['key_vectors'].t() - inv_mom2_cache['value_vectors'].t()
-            #print('distance after:', torch.norm(diff))
-            #time.sleep(5)
-
-
             deltas[weight_name] = (
                 left_vector.detach(),
                 right_vector.detach(),
@@ -259,7 +175,7 @@ def get_context_templates(model, tok, length_params):
                         model,
                         tok,
                         ["<|endoftext|>"],
-                        n_gen ,
+                        n_gen_per_prompt=n_gen,
                         max_out_len=length,
                     )
                     for length, n_gen in length_params

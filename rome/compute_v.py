@@ -26,17 +26,20 @@ def compute_v(
     """
 
     print("Computing right vector (v)")
+
     # Tokenize target into list of int token IDs
     target_ids = tok(request["target_new"]["str"], return_tensors="pt").to("cuda")[
         "input_ids"
     ][0]
 
     # Compile list of rewriting and KL x/y pairs
-    rewriting_prompts, kl_prompts = [
-        context.format(request["prompt"]) + tok.decode(target_ids[:-1])####NOTE:adds all token of target except last token. This is the Language Modelling objective.
-        for context in context_templates
-    ], ["{} is a"]
-    ###NOTE: KL prompt is just ["{} is a"]. Can we have a more exhaustive list of re-write prompts?
+    rewriting_prompts, kl_prompts = (
+        [
+            context.format(request["prompt"]) + tok.decode(target_ids[:-1])
+            for context in context_templates
+        ],
+        ["{} is a"],
+    )
     all_prompts = rewriting_prompts + kl_prompts
 
     input_tok = tok(
@@ -48,13 +51,10 @@ def compute_v(
     # Compute rewriting targets
     rewriting_targets = torch.tensor(-100, device="cuda").repeat(
         len(rewriting_prompts), *input_tok["input_ids"].shape[1:]
-    )#excludes the kl_prompt i think. Creates array identical to input_tok[]
-
-    #replace part of rewriting_targets with the target ids
+    )
     for i in range(len(rewriting_prompts)):
         ex_len = input_tok["attention_mask"][i].sum()
-        rewriting_targets[i, ex_len - len(target_ids) : ex_len] = target_ids###NOTE:rewriting prompt is made up of target_ids[:-1]. See where it becomes important. Because of the LM objective
-
+        rewriting_targets[i, ex_len - len(target_ids) : ex_len] = target_ids
 
     # Compute indices of the tokens where the fact is looked up
     lookup_idxs = [
@@ -72,22 +72,18 @@ def compute_v(
     # Set up an optimization over a latent vector that, when output at the
     # rewrite layer, i.e. hypothesized fact lookup location, will induce the
     # target token to be predicted at the final layer.
-    try:#for llama model
-        delta = torch.zeros((model.config.n_embd,), requires_grad=True, device="cuda")
-    except:
-        delta = torch.zeros((model.config.hidden_size,), requires_grad=True, device="cuda")
-
+    delta = torch.zeros((model.config.n_embd,), requires_grad=True, device="cuda")
     target_init, kl_distr_init = None, None
 
     # Inserts new "delta" variable at the appropriate part of the computation
     def edit_output_fn(cur_out, cur_layer):
         nonlocal target_init
 
-        if cur_layer == hparams.mlp_module_tmp.format(layer):##changes are only made to the layer being edited
+        if cur_layer == hparams.mlp_module_tmp.format(layer):
             # Store initial value of the vector of interest
             if target_init is None:
                 print("Recording initial value of v*")
-                # Initial value is recorded for the clean sentence##NOTE -should target init be an average of outputs of all inputs. Not sure if it matters.
+                # Initial value is recorded for the clean sentence
                 target_init = cur_out[0, lookup_idxs[0]].detach().clone()
 
             for i, idx in enumerate(lookup_idxs):
@@ -96,19 +92,18 @@ def compute_v(
         return cur_out
 
     # Optimizer
-    opt = torch.optim.Adam([delta], lr=hparams.v_lr)####NOTE:the vector representation to be found is initialized by zeros. Is the a better initialization?
+    opt = torch.optim.Adam([delta], lr=hparams.v_lr)
     nethook.set_requires_grad(False, model)
 
     # Execute optimization
     for it in range(hparams.v_num_grad_steps):
-        print('ITERATION:', it)
         opt.zero_grad()
 
         # Forward propagation
         with nethook.TraceDict(
             module=model,
             layers=[
-                hparams.layer_module_tmp.format(loss_layer),#The first layer is the final layer where loss is calculated (47 for gpt2xl)
+                hparams.layer_module_tmp.format(loss_layer),
                 hparams.mlp_module_tmp.format(layer),
             ],
             retain_input=False,
@@ -117,7 +112,7 @@ def compute_v(
         ) as tr:
             logits = model(**input_tok).logits
 
-            # Compute distribution for KL divergence. Extract target v* for KL for each kl prompt
+            # Compute distribution for KL divergence
             kl_logits = torch.stack(
                 [
                     logits[i - len(kl_prompts), idx, :]
@@ -125,8 +120,7 @@ def compute_v(
                 ],
                 dim=0,
             )
-
-            kl_log_probs = torch.nn.functional.log_softmax(kl_logits, dim=1)#creating a probability distribution for logits
+            kl_log_probs = torch.nn.functional.log_softmax(kl_logits, dim=1)
             if kl_distr_init is None:
                 kl_distr_init = kl_log_probs.detach().clone()
 
@@ -137,7 +131,7 @@ def compute_v(
             log_probs,
             2,
             torch.where(rewriting_targets != -100, rewriting_targets, 0).unsqueeze(2),
-        ).squeeze(2)#loss has the probability values of vocabulary indices of interest
+        ).squeeze(2)
         mask = (rewriting_targets != -100).float()
 
         # Aggregate total losses
@@ -172,36 +166,47 @@ def compute_v(
             with torch.no_grad():
                 delta[...] = delta * max_norm / delta.norm()
 
-    target = target_init + delta #NOTE: this is v* (note that target init was the representation of the clean output. So only representation of clean output is altered such that final output is o*. Maybe we should do it for average representation of input keys.)
+    if hparams.enable_random_prefix_keys:
+        cur_inputs, cur_outputs = [], []
+        # run hook for all random prefixes
+        for context_template in context_templates:
+            cur_input, cur_output = get_module_input_output_at_word(
+                model,
+                tok,
+                layer,
+                context_template=context_template.format(request["prompt"]),
+                word=request["subject"],
+                module_template=hparams.rewrite_module_tmp,
+                fact_token_strategy=hparams.fact_token,
+            )
+            cur_inputs.append(cur_input)
+            cur_outputs.append(cur_output)
 
-    # Retrieve cur_input, the current input to the 2nd MLP layer, and
-    # cur_output, the original output of the 2nd MLP layer.
-    cur_input, cur_output = get_module_input_output_at_word(
-        model,
-        tok,
-        layer,
-        context_template=request["prompt"],#only done for the prompt being edited
-        word=request["subject"],
-        module_template=hparams.rewrite_module_tmp,
-        fact_token_strategy=hparams.fact_token,
-    )
+        # average the representations across prefixes
+        cur_input = torch.stack(cur_inputs).mean(0)
+        cur_output = torch.stack(cur_outputs).mean(0)
 
-    if False:#has no effect on disabling edits : NO BIAS BIAS CORRECTION
-        print('\n'*5, 'ENTERING BIAS CORRECTION', '\n'*5)
-        layer_name = hparams.rewrite_module_tmp.format(layer) + ".bias"
-        layer_bias = nethook.get_parameter(model, layer_name)
-        target = target - layer_bias
+        # target_init is v*, based on output from random prefix computations
+        target = target_init + delta
+    else:
+        # Original ROME code
+        # Retrieve cur_input, the current input to the 2nd MLP layer, and
+        # cur_output, the original output of the 2nd MLP layer.
+        cur_input, cur_output = get_module_input_output_at_word(
+            model,
+            tok,
+            layer,
+            context_template=request["prompt"],  # only done for the prompt being edited
+            word=request["subject"],
+            module_template=hparams.rewrite_module_tmp,
+            fact_token_strategy=hparams.fact_token,
+        )
 
-    if hparams.bias_update:
-        print('\n'*5, 'ENTERING BIAS CORRECTION', '\n'*5)
-        bias_correction = torch.tensor([1], dtype=cur_input.dtype, device=cur_input.device)
-        cur_input= torch.cat((cur_input, bias_correction), dim = 0)
+        # cur_output is v, based on output from prompt-only computations
+        target = cur_output + delta
 
     # Solving the linear system to compute the right vector
     right_vector = (target - cur_output) / torch.dot(cur_input, left_vector)
-    ####NOTE - cur_output is supposed to represent k*. but here it only represents the key for the specific prompt input that is being changed. 
-    ####NOTE - Also, v* = target_init + delta. Although delta is being calculated over bunch of prompts, target_init is only the representation of the clean prompt. This may or maynot be helpful, but this is how the proof differs from original.
-    ####NOTE - The denominator is supposed to (C^-1k*^T)k*. In reality, cur_input is not k* but the key of only the prompt being corrected. 
     print(f"Delta norm: {(target - cur_output).norm().item()}")
     print(
         f"Change in target norm: {target_init.norm().item()} to {target.norm().item()} => {(target.norm() - target_init.norm()).item()}"
