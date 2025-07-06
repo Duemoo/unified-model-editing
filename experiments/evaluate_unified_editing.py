@@ -223,7 +223,7 @@ def main(
             if conserve_memory
             else dict()
         )
-        etc_args = dict(cache_template=cache_template) if any(alg in alg_name for alg in ["ROME", "MEMIT"]) else dict()
+        # etc_args = dict(cache_template=cache_template) if any(alg in alg_name for alg in ["ROME", "MEMIT"]) else dict()
 
                 ##decode the number of few shots
         if args.do_downstream_eval and downstream_tasks is None:
@@ -310,7 +310,6 @@ def main(
             with open(out_file, "w") as f:
                 json.dump(metrics, f, indent=1)
 
-        start = time()
         edited_model, weights_copy, objective_distances = apply_algo(
             model,
             tok,
@@ -321,13 +320,8 @@ def main(
             hparams,
             copy=False,
             return_orig_weights=True,
-            **args_conserve_memory,
-            **etc_args,
+            **args_conserve_memory
         )
-
-        exec_time = time() - start
-        print("Execution took", exec_time)
-
 
         #Do GLUE EVALUATION
         distance = get_model_distance(original_weights, edited_model, hparams)
@@ -359,42 +353,49 @@ def main(
 
         # Evaluate new model
         start = time()
-        for record in record_chunks:
+        for record in record_chunks:       # inner loop over the *individual* edits
             out_file = Path(case_result_template.format(num_edits, r, record["case_id"]))
+            if out_file.exists():
+                print(f"Skipping {out_file}; already exists")
+                continue
 
-            with open(out_file, 'r+') as f:
-                data = json.load(f)
-                data['time'] = exec_time,
+            # ---------- PRE ----------
+            pre = ds_eval_method(
+                model, tok, record,
+                *(gen_test_vars if record["case_id"] % generation_test_interval == 0
+                else [None, None])
+            )
 
-                post_list = ds_eval_method(
-                    edited_model,
-                    tok,
-                    record,
-                    *(
-                        gen_test_vars
-                        if record["case_id"] % generation_test_interval == 0
-                        else [None, None]
-                    ),
-                )
-                for key, value in post_list.items():
-                    if key in ["paraphrase_prompts_probs", "neighborhood_prompts_probs", "rewrite_prompts_probs", "attribute_prompts_probs"]:
-                        for i in range(len(data['post'][key])):
-                            data['post'][key][i]['post_sliding_text'] = post_list[key][i]['sliding_text']
-                            data['post'][key][i]['post_sliding_correct'] = post_list[key][i]['sliding_correct']
-                            data['post'][key][i]['post_target_new_prob'] = post_list[key][i]['target_new_prob']
-                            data['post'][key][i]['post_target_true_prob'] = post_list[key][i]['target_true_prob']
-                    if key in ["rewrite_prompts_correct", "paraphrase_prompts_correct", "neighborhood_prompts_correct", "attribute_prompts_correct" "text", "ngram_entropy", "essence_score"]:
-                        data['post']['post_' + key] = post_list[key]
+            # ---------- EDIT ----------
+            edited_model, weights_copy, obj_dists = apply_algo(
+                model, tok, [ {**record["requested_rewrite"], "case_id": record["case_id"]} ],
+                hparams, copy=False, return_orig_weights=True, **args_conserve_memory
+            )
 
-                f.seek(0)        # <--- should reset file position to the beginning.
-                json.dump(data, f, indent=4)
-                f.truncate()
+            # ---------- POST ----------
+            post = ds_eval_method(
+                edited_model, tok, record,
+                *(gen_test_vars if record["case_id"] % generation_test_interval == 0
+                else [None, None])
+            )
 
-        if not sequential:
-            # Restore original weights
-            with torch.no_grad():
-                for k, v in weights_copy.items():
-                    nethook.get_parameter(model, k)[...] = v.to("cuda")
+            # ---------- SAVE ----------
+            metrics = {
+                "case_id": record["case_id"],
+                "requested_rewrite": record["requested_rewrite"],
+                "num_edits": 1,
+                "time": time(),           # or exec_time if you keep it
+                "pre":  pre,
+                "post": post,
+            }
+            with open(out_file, "w") as f:
+                json.dump(metrics, f, indent=1)
+
+            # restore weights if you’re not doing sequential edits
+            if not sequential:
+                with torch.no_grad():
+                    for k, v in weights_copy.items():
+                        nethook.get_parameter(model, k)[...] = v.to("cuda")
 
         print("Evaluation took", time() - start)
 
